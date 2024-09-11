@@ -51,7 +51,7 @@ services:
       - redis
       - playwright-service
     ports:
-      - "5701:3002"
+      - "5701:5701"
     command: [ "pnpm", "run", "start:production" ]
 
   worker:
