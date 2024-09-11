@@ -22,8 +22,6 @@ import { ErrorResponse, ResponseWithSentry } from "./controllers/v1/types";
 import { ZodError } from "zod";
 import { v4 as uuidv4 } from "uuid";
 
-console.log("env port is: ", process.env.PORT);
-
 const { createBullBoard } = require("@bull-board/api");
 const { BullAdapter } = require("@bull-board/api/bullAdapter");
 const { ExpressAdapter } = require("@bull-board/express");
@@ -92,7 +90,7 @@ if (cluster.isMaster) {
   app.use("/v1", v1Router);
   app.use(adminRouter);
 
-  const DEFAULT_PORT = process.env.PORT ?? 3002;
+  const DEFAULT_PORT = 5701; //process.env.PORT ?? 3002;
   const HOST = process.env.HOST ?? "localhost";
 
   // HyperDX OpenTelemetry
@@ -117,9 +115,7 @@ if (cluster.isMaster) {
   app.get(`/serverHealthCheck`, async (req, res) => {
     try {
       const scrapeQueue = getScrapeQueue();
-      const [waitingJobs] = await Promise.all([
-        scrapeQueue.getWaitingCount(),
-      ]);
+      const [waitingJobs] = await Promise.all([scrapeQueue.getWaitingCount()]);
 
       const noWaitingJobs = waitingJobs === 0;
       // 200 if no active jobs, 503 if there are active jobs
@@ -192,36 +188,73 @@ if (cluster.isMaster) {
     res.send({ isProduction: global.isProduction });
   });
 
-  app.use((err: unknown, req: Request<{}, ErrorResponse, undefined>, res: Response<ErrorResponse>, next: NextFunction) => {
-    if (err instanceof ZodError) {
-        res.status(400).json({ success: false, error: "Bad Request", details: err.errors });
-    } else {
+  app.use(
+    (
+      err: unknown,
+      req: Request<{}, ErrorResponse, undefined>,
+      res: Response<ErrorResponse>,
+      next: NextFunction
+    ) => {
+      if (err instanceof ZodError) {
+        res
+          .status(400)
+          .json({ success: false, error: "Bad Request", details: err.errors });
+      } else {
         next(err);
+      }
     }
-  });
+  );
 
   Sentry.setupExpressErrorHandler(app);
 
-  app.use((err: unknown, req: Request<{}, ErrorResponse, undefined>, res: ResponseWithSentry<ErrorResponse>, next: NextFunction) => {
-    if (err instanceof SyntaxError && 'status' in err && err.status === 400 && 'body' in err) {
-      return res.status(400).json({ success: false, error: 'Bad request, malformed JSON' });
-    }
-
-    const id = res.sentry ?? uuidv4();
-    let verbose = JSON.stringify(err);
-    if (verbose === "{}") {
-      if (err instanceof Error) {
-        verbose = JSON.stringify({
-          message: err.message,
-          name: err.name,
-          stack: err.stack,
-        });
+  app.use(
+    (
+      err: unknown,
+      req: Request<{}, ErrorResponse, undefined>,
+      res: ResponseWithSentry<ErrorResponse>,
+      next: NextFunction
+    ) => {
+      if (
+        err instanceof SyntaxError &&
+        "status" in err &&
+        err.status === 400 &&
+        "body" in err
+      ) {
+        return res
+          .status(400)
+          .json({ success: false, error: "Bad request, malformed JSON" });
       }
-    }
 
-    Logger.error("Error occurred in request! (" + req.path + ") -- ID " + id  + " -- " + verbose);
-    res.status(500).json({ success: false, error: "An unexpected error occurred. Please contact hello@firecrawl.com for help. Your exception ID is " + id });
-  });
+      const id = res.sentry ?? uuidv4();
+      let verbose = JSON.stringify(err);
+      if (verbose === "{}") {
+        if (err instanceof Error) {
+          verbose = JSON.stringify({
+            message: err.message,
+            name: err.name,
+            stack: err.stack,
+          });
+        }
+      }
+
+      Logger.error(
+        "Error occurred in request! (" +
+          req.path +
+          ") -- ID " +
+          id +
+          " -- " +
+          verbose
+      );
+      res
+        .status(500)
+        .json({
+          success: false,
+          error:
+            "An unexpected error occurred. Please contact hello@firecrawl.com for help. Your exception ID is " +
+            id,
+        });
+    }
+  );
 
   Logger.info(`Worker ${process.pid} started`);
 }
