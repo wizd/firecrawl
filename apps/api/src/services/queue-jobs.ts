@@ -62,10 +62,14 @@ export function waitForJob(jobId: string, timeout: number) {
           clearInterval(int);
           resolve((await getScrapeQueue().getJob(jobId)).returnvalue);
         } else if (state === "failed") {
-          clearInterval(int);
-          reject((await getScrapeQueue().getJob(jobId)).failedReason);
+          // console.log("failed", (await getScrapeQueue().getJob(jobId)).failedReason);
+          const job = await getScrapeQueue().getJob(jobId);
+          if (job && job.failedReason !== "Concurrency limit hit") {
+            clearInterval(int);
+            reject(job.failedReason);
+          }
         }
       }
-    }, 1000);
+    }, 500);
   })
 }

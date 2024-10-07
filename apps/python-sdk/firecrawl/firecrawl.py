@@ -13,7 +13,6 @@ import logging
 import os
 import time
 from typing import Any, Dict, Optional, List
-import asyncio
 import json
 
 import requests
@@ -59,20 +58,16 @@ class FirecrawlApp:
 
         # If there are additional params, process them
         if params:
-            # Initialize extractorOptions if present
-            extractor_options = params.get('extractorOptions', {})
-            # Check and convert the extractionSchema if it's a Pydantic model
-            if 'extractionSchema' in extractor_options:
-                if hasattr(extractor_options['extractionSchema'], 'schema'):
-                    extractor_options['extractionSchema'] = extractor_options['extractionSchema'].schema()
-                # Ensure 'mode' is set, defaulting to 'llm-extraction' if not explicitly provided
-                extractor_options['mode'] = extractor_options.get('mode', 'llm-extraction')
-                # Update the scrape_params with the processed extractorOptions
-                scrape_params['extractorOptions'] = extractor_options
+            # Handle extract (for v1)
+            extract = params.get('extract', {})
+            if extract:
+                if 'schema' in extract and hasattr(extract['schema'], 'schema'):
+                    extract['schema'] = extract['schema'].schema()
+                scrape_params['extract'] = extract
 
             # Include any other params directly at the top level of scrape_params
             for key, value in params.items():
-                if key != 'extractorOptions':
+                if key not in ['extract']:
                     scrape_params[key] = value
 
         endpoint = f'/v1/scrape'
@@ -233,7 +228,7 @@ class FirecrawlApp:
         json_data = {'url': url}
         if params:
             json_data.update(params)
-        
+
         # Make the POST request with the prepared headers and JSON data
         response = requests.post(
             f'{self.api_url}{endpoint}',
@@ -242,9 +237,8 @@ class FirecrawlApp:
         )
         if response.status_code == 200:
             response = response.json()
-            print(response)
             if response['success'] and 'links' in response:
-                return response['links']
+                return response
             else:
                 raise Exception(f'Failed to map URL. Error: {response["error"]}')
         else:
@@ -350,6 +344,12 @@ class FirecrawlApp:
                 status_data = status_response.json()
                 if status_data['status'] == 'completed':
                     if 'data' in status_data:
+                        data = status_data['data']
+                        while 'next' in status_data:
+                          status_response = self._get_request(status_data['next'], headers)
+                          status_data = status_response.json()
+                          data.extend(status_data['data'])
+                        status_data['data'] = data
                         return status_data
                     else:
                         raise Exception('Crawl job completed but no data was returned')
