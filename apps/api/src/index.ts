@@ -1,5 +1,5 @@
 import "dotenv/config";
-import "./services/sentry"
+import "./services/sentry";
 import * as Sentry from "@sentry/node";
 import express, { NextFunction, Request, Response } from "express";
 import bodyParser from "body-parser";
@@ -12,9 +12,9 @@ import os from "os";
 import { Logger } from "./lib/logger";
 import { adminRouter } from "./routes/admin";
 import { ScrapeEvents } from "./lib/scrape-events";
-import http from 'node:http';
-import https from 'node:https';
-import CacheableLookup  from 'cacheable-lookup';
+import http from "node:http";
+import https from "node:https";
+import CacheableLookup from "cacheable-lookup";
 import { v1Router } from "./routes/v1";
 import expressWs from "express-ws";
 import { crawlStatusWSController } from "./controllers/v1/crawl-status-ws";
@@ -31,11 +31,11 @@ Logger.info(`Number of CPUs: ${numCPUs} available`);
 
 const cacheable = new CacheableLookup({
   // this is important to avoid querying local hostnames see https://github.com/szmarczak/cacheable-lookup readme
-  lookup:false
+  lookup: false,
 });
 
 cacheable.install(http.globalAgent);
-cacheable.install(https.globalAgent)
+cacheable.install(https.globalAgent);
 
 if (cluster.isMaster) {
   Logger.info(`Master ${process.pid} is running`);
@@ -196,6 +196,15 @@ if (cluster.isMaster) {
       next: NextFunction
     ) => {
       if (err instanceof ZodError) {
+        if (
+          Array.isArray(err.errors) &&
+          err.errors.find((x) => x.message === "URL uses unsupported protocol")
+        ) {
+          Logger.warn(
+            "Unsupported protocol error: " + JSON.stringify(req.body)
+          );
+        }
+
         res
           .status(400)
           .json({ success: false, error: "Bad Request", details: err.errors });
@@ -245,21 +254,17 @@ if (cluster.isMaster) {
           " -- " +
           verbose
       );
-      res
-        .status(500)
-        .json({
-          success: false,
-          error:
-            "An unexpected error occurred. Please contact hello@firecrawl.com for help. Your exception ID is " +
-            id,
-        });
+      res.status(500).json({
+        success: false,
+        error:
+          "An unexpected error occurred. Please contact hello@firecrawl.com for help. Your exception ID is " +
+          id,
+      });
     }
   );
 
   Logger.info(`Worker ${process.pid} started`);
 }
-
-
 
 // const sq = getScrapeQueue();
 
@@ -269,6 +274,3 @@ if (cluster.isMaster) {
 // sq.on("paused", j => ScrapeEvents.logJobEvent(j, "paused"));
 // sq.on("resumed", j => ScrapeEvents.logJobEvent(j, "resumed"));
 // sq.on("removed", j => ScrapeEvents.logJobEvent(j, "removed"));
-
-
-
