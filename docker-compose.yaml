@@ -13,7 +13,7 @@ services:
   playwright-service:
     build: apps/playwright-service
     environment:
-      - PORT=3000
+      - PORT=5702
       - PROXY_SERVER=${PROXY_SERVER}
       - PROXY_USERNAME=${PROXY_USERNAME}
       - PROXY_PASSWORD=${PROXY_PASSWORD}
