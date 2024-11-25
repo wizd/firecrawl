@@ -2,14 +2,11 @@ import axios, { AxiosError } from "axios";
 import cheerio, { load } from "cheerio";
 import { URL } from "url";
 import { getLinksFromSitemap } from "./sitemap";
-import async from "async";
-import { CrawlerOptions, PageOptions, Progress } from "../../lib/entities";
-import { scrapSingleUrl } from "./single_url";
 import robotsParser from "robots-parser";
 import { getURLDepth } from "./utils/maxDepthUtils";
 import { axiosTimeout } from "../../../src/lib/timeout";
-import { Logger } from "../../../src/lib/logger";
-
+import { logger } from "../../../src/lib/logger";
+import https from "https";
 export class WebCrawler {
   private jobId: string;
   private initialUrl: string;
@@ -26,10 +23,12 @@ export class WebCrawler {
   private generateImgAltText: boolean;
   private allowBackwardCrawling: boolean;
   private allowExternalContentLinks: boolean;
+  private allowSubdomains: boolean;
 
   constructor({
     jobId,
     initialUrl,
+    baseUrl,
     includes,
     excludes,
     maxCrawledLinks = 10000,
@@ -37,10 +36,12 @@ export class WebCrawler {
     generateImgAltText = false,
     maxCrawledDepth = 10,
     allowBackwardCrawling = false,
-    allowExternalContentLinks = false
+    allowExternalContentLinks = false,
+    allowSubdomains = false,
   }: {
     jobId: string;
     initialUrl: string;
+    baseUrl?: string;
     includes?: string[];
     excludes?: string[];
     maxCrawledLinks?: number;
@@ -49,10 +50,11 @@ export class WebCrawler {
     maxCrawledDepth?: number;
     allowBackwardCrawling?: boolean;
     allowExternalContentLinks?: boolean;
+    allowSubdomains?: boolean;
   }) {
     this.jobId = jobId;
     this.initialUrl = initialUrl;
-    this.baseUrl = new URL(initialUrl).origin;
+    this.baseUrl = baseUrl ?? new URL(initialUrl).origin;
     this.includes = Array.isArray(includes) ? includes : [];
     this.excludes = Array.isArray(excludes) ? excludes : [];
     this.limit = limit;
@@ -64,16 +66,22 @@ export class WebCrawler {
     this.generateImgAltText = generateImgAltText ?? false;
     this.allowBackwardCrawling = allowBackwardCrawling ?? false;
     this.allowExternalContentLinks = allowExternalContentLinks ?? false;
+    this.allowSubdomains = allowSubdomains ?? false;
   }
 
-  public filterLinks(sitemapLinks: string[], limit: number, maxDepth: number): string[] {
+  public filterLinks(sitemapLinks: string[], limit: number, maxDepth: number, fromMap: boolean = false): string[] {
+    // If the initial URL is a sitemap.xml, skip filtering
+    if (this.initialUrl.endsWith('sitemap.xml') && fromMap) {
+      return sitemapLinks.slice(0, limit);
+    }
+
     return sitemapLinks
       .filter((link) => {
         let url: URL;
         try {
           url = new URL(link.trim(), this.baseUrl);
         } catch (error) {
-          Logger.debug(`Error processing link: ${link} | Error: ${error.message}`);
+          logger.debug(`Error processing link: ${link} | Error: ${error.message}`);
           return false;
         }
         const path = url.pathname;
@@ -132,7 +140,11 @@ export class WebCrawler {
         const isAllowed = this.robots.isAllowed(link, "FireCrawlAgent") ?? true;
         // Check if the link is disallowed by robots.txt
         if (!isAllowed) {
-          Logger.debug(`Link disallowed by robots.txt: ${link}`);
+          logger.debug(`Link disallowed by robots.txt: ${link}`);
+          return false;
+        }
+
+        if (this.isFile(link)) {
           return false;
         }
 
@@ -141,8 +153,14 @@ export class WebCrawler {
       .slice(0, limit);
   }
 
-  public async getRobotsTxt(): Promise<string> {
-    const response = await axios.get(this.robotsTxtUrl, { timeout: axiosTimeout });
+  public async getRobotsTxt(skipTlsVerification = false): Promise<string> {
+    let extraArgs = {};
+    if(skipTlsVerification) {
+      extraArgs["httpsAgent"] = new https.Agent({
+        rejectUnauthorized: false
+      });
+    }
+    const response = await axios.get(this.robotsTxtUrl, { timeout: axiosTimeout, ...extraArgs });
     return response.data;
   }
 
@@ -150,130 +168,24 @@ export class WebCrawler {
     this.robots = robotsParser(this.robotsTxtUrl, txt);
   }
 
-  public async tryGetSitemap(): Promise<{ url: string; html: string; }[] | null> {
-    Logger.debug(`Fetching sitemap links from ${this.initialUrl}`);
+  public async tryGetSitemap(fromMap: boolean = false, onlySitemap: boolean = false): Promise<{ url: string; html: string; }[] | null> {
+    logger.debug(`Fetching sitemap links from ${this.initialUrl}`);
     const sitemapLinks = await this.tryFetchSitemapLinks(this.initialUrl);
+    if(fromMap && onlySitemap) {
+      return sitemapLinks.map(link => ({ url: link, html: "" }));
+    }
     if (sitemapLinks.length > 0) {
-      let filteredLinks = this.filterLinks(sitemapLinks, this.limit, this.maxCrawledDepth);
+      let filteredLinks = this.filterLinks(sitemapLinks, this.limit, this.maxCrawledDepth, fromMap);
       return filteredLinks.map(link => ({ url: link, html: "" }));
     }
     return null;
-  }
-
-  public async start(
-    inProgress?: (progress: Progress) => void,
-    pageOptions?: PageOptions,
-    crawlerOptions?: CrawlerOptions,
-    concurrencyLimit: number = 5,
-    limit: number = 10000,
-    maxDepth: number = 10
-  ): Promise<{ url: string, html: string }[]> {
-
-    Logger.debug(`Crawler starting with ${this.initialUrl}`);
-    // Fetch and parse robots.txt
-    try {
-      const txt = await this.getRobotsTxt();
-      this.importRobotsTxt(txt);
-      Logger.debug(`Crawler robots.txt fetched with ${this.robotsTxtUrl}`);
-    } catch (error) {
-      Logger.debug(`Failed to fetch robots.txt from ${this.robotsTxtUrl}`);
-    }
-
-    if (!crawlerOptions?.ignoreSitemap){
-      const sm = await this.tryGetSitemap();
-      if (sm !== null) {
-        return sm;
-      }
-    }
-
-    const urls = await this.crawlUrls(
-      [this.initialUrl],
-      pageOptions,
-      concurrencyLimit,
-      inProgress
-    );
-    
-    if (
-      urls.length === 0 &&
-      this.filterLinks([this.initialUrl], limit, this.maxCrawledDepth).length > 0
-    ) {
-      return [{ url: this.initialUrl, html: "" }];
-    }
-
-    // make sure to run include exclude here again
-    const filteredUrls = this.filterLinks(urls.map(urlObj => urlObj.url), limit, this.maxCrawledDepth);
-    return filteredUrls.map(url => ({ url, html: urls.find(urlObj => urlObj.url === url)?.html || "" }));
-  }
-
-  private async crawlUrls(
-    urls: string[],
-    pageOptions: PageOptions,
-    concurrencyLimit: number,
-    inProgress?: (progress: Progress) => void,
-  ): Promise<{ url: string, html: string }[]> {
-    const queue = async.queue(async (task: string, callback) => {
-      Logger.debug(`Crawling ${task}`);
-      if (this.crawledUrls.size >= Math.min(this.maxCrawledLinks, this.limit)) {
-        if (callback && typeof callback === "function") {
-          callback();
-        }
-        return;
-      }
-      const newUrls = await this.crawl(task, pageOptions);
-      // add the initial url if not already added
-      // if (this.visited.size === 1) {
-      //   let normalizedInitial = this.initialUrl;
-      //   if (!normalizedInitial.endsWith("/")) {
-      //     normalizedInitial = normalizedInitial + "/";
-      //   }
-      //   if (!newUrls.some(page => page.url === this.initialUrl)) {
-      //     newUrls.push({ url: this.initialUrl, html: "" });
-      //   }
-      // }
-
-      newUrls.forEach((page) => this.crawledUrls.set(page.url, page.html));
-      
-      if (inProgress && newUrls.length > 0) {
-        inProgress({
-          current: this.crawledUrls.size,
-          total: Math.min(this.maxCrawledLinks, this.limit),
-          status: "SCRAPING",
-          currentDocumentUrl: newUrls[newUrls.length - 1].url,
-        });
-      } else if (inProgress) {
-        inProgress({
-          current: this.crawledUrls.size,
-          total: Math.min(this.maxCrawledLinks, this.limit),
-          status: "SCRAPING",
-          currentDocumentUrl: task,
-        });
-      }
-      await this.crawlUrls(newUrls.map((p) => p.url), pageOptions, concurrencyLimit, inProgress);
-      if (callback && typeof callback === "function") {
-        callback();
-      }
-    }, concurrencyLimit);
-
-    Logger.debug(`🐂 Pushing ${urls.length} URLs to the queue`);
-    queue.push(
-      urls.filter(
-        (url) =>
-          !this.visited.has(url) && this.robots.isAllowed(url, "FireCrawlAgent")
-      ),
-      (err) => {
-        if (err) Logger.error(`🐂 Error pushing URLs to the queue: ${err}`);
-      }
-    );
-    await queue.drain();
-    Logger.debug(`🐂 Crawled ${this.crawledUrls.size} URLs, Queue drained.`);
-    return Array.from(this.crawledUrls.entries()).map(([url, html]) => ({ url, html }));
   }
 
   public filterURL(href: string, url: string): string | null {
     let fullUrl = href;
     if (!href.startsWith("http")) {
       try {
-        fullUrl = new URL(href, this.baseUrl).toString();
+        fullUrl = new URL(href, url).toString();
       } catch (_) {
         return null;
       }
@@ -306,6 +218,10 @@ export class WebCrawler {
       }
     }
 
+    if (this.allowSubdomains && !this.isSocialMediaOrEmail(fullUrl) && this.isSubdomain(fullUrl)) {
+      return fullUrl;
+    }
+
     return null;
   }
 
@@ -314,8 +230,11 @@ export class WebCrawler {
 
     const $ = load(html);
     $("a").each((_, element) => {
-      const href = $(element).attr("href");
+      let href = $(element).attr("href");
       if (href) {
+        if (href.match(/^https?:\/[^\/]/)) {
+          href = href.replace(/^https?:\//, "$&/");
+        }
         const u = this.filterURL(href, url);
         if (u !== null) {
           links.push(u);
@@ -323,81 +242,21 @@ export class WebCrawler {
       }
     });
 
+    // Extract links from iframes with inline src
+    $("iframe").each((_, element) => {
+      const src = $(element).attr("src");
+      if (src && src.startsWith("data:text/html")) {
+        const iframeHtml = decodeURIComponent(src.split(",")[1]);
+        const iframeLinks = this.extractLinksFromHTML(iframeHtml, url);
+        links = links.concat(iframeLinks);
+      }
+    });
+
     return links;
-  }
-
-  async crawl(url: string, pageOptions: PageOptions): Promise<{url: string, html: string, pageStatusCode?: number, pageError?: string}[]> {
-    if (this.visited.has(url) || !this.robots.isAllowed(url, "FireCrawlAgent")) {
-      return [];
-    }
-    this.visited.add(url);
-
-    if (!url.startsWith("http")) {
-      url = "https://" + url;
-    }
-    if (url.endsWith("/")) {
-      url = url.slice(0, -1);
-    }
-
-    if (this.isFile(url) || this.isSocialMediaOrEmail(url)) {
-      return [];
-    }
-
-    try {
-      let content: string = "";
-      let pageStatusCode: number;
-      let pageError: string | undefined = undefined;
-
-      // If it is the first link, fetch with single url
-      if (this.visited.size === 1) {
-        const page = await scrapSingleUrl(this.jobId, url, { ...pageOptions, includeHtml: true });
-        content = page.html ?? "";
-        pageStatusCode = page.metadata?.pageStatusCode;
-        pageError = page.metadata?.pageError || undefined;
-      } else {
-        const response = await axios.get(url, { timeout: axiosTimeout });
-        content = response.data ?? "";
-        pageStatusCode = response.status;
-        pageError = response.statusText != "OK" ? response.statusText : undefined;
-      }
-
-      const $ = load(content);
-      let links: { url: string, html: string, pageStatusCode?: number, pageError?: string }[] = [];
-
-      // Add the initial URL to the list of links
-      if (this.visited.size === 1) {
-        links.push({ url, html: content, pageStatusCode, pageError });
-      }
-
-      links.push(...this.extractLinksFromHTML(content, url).map(url => ({ url, html: content, pageStatusCode, pageError })));
-      
-      if (this.visited.size === 1) {
-        return links;
-      }
-
-      // Create a new list to return to avoid modifying the visited list
-      return links.filter((link) => !this.visited.has(link.url));
-    } catch (error) {
-      return [];
-    }
   }
 
   private isRobotsAllowed(url: string): boolean {
     return (this.robots ? (this.robots.isAllowed(url, "FireCrawlAgent") ?? true) : true)
-  }
-  private normalizeCrawlUrl(url: string): string {
-    try{
-      const urlObj = new URL(url);
-      urlObj.searchParams.sort(); // Sort query parameters to normalize
-      return urlObj.toString();
-    } catch (error) {
-      return url;
-    }
-  }
-
-  private matchesIncludes(url: string): boolean {
-    if (this.includes.length === 0 || this.includes[0] == "") return true;
-    return this.includes.some((pattern) => new RegExp(pattern).test(url));
   }
 
   private matchesExcludes(url: string, onlyDomains: boolean = false): boolean {
@@ -449,6 +308,10 @@ export class WebCrawler {
     return linkDomain === baseDomain;
   }
 
+  private isSubdomain(link: string): boolean {
+    return new URL(link, this.baseUrl).hostname.endsWith("." + new URL(this.baseUrl).hostname.split(".").slice(-2).join("."));
+  }
+
   public isFile(url: string): boolean {
     const fileExtensions = [
       ".png",
@@ -478,7 +341,14 @@ export class WebCrawler {
       ".webp",
       ".inc"
     ];
-    return fileExtensions.some((ext) => url.toLowerCase().endsWith(ext));
+
+    try {
+      const urlWithoutQuery = url.split('?')[0].toLowerCase();
+      return fileExtensions.some((ext) => urlWithoutQuery.endsWith(ext));
+    } catch (error) {
+      logger.error(`Error processing URL in isFile: ${error}`);
+      return false;
+    }
   }
 
   private isSocialMediaOrEmail(url: string): boolean {
@@ -497,7 +367,6 @@ export class WebCrawler {
     return socialMediaOrEmail.some((ext) => url.includes(ext));
   }
 
-  // 
   private async tryFetchSitemapLinks(url: string): Promise<string[]> {
     const normalizeUrl = (url: string) => {
       url = url.replace(/^https?:\/\//, "").replace(/^www\./, "");
@@ -507,7 +376,8 @@ export class WebCrawler {
       return url;
     };
 
-    const sitemapUrl = url.endsWith("/sitemap.xml")
+
+    const sitemapUrl = url.endsWith(".xml")
       ? url
       : `${url}/sitemap.xml`;
 
@@ -519,7 +389,7 @@ export class WebCrawler {
         sitemapLinks = await getLinksFromSitemap({ sitemapUrl });
       }
     } catch (error) { 
-      Logger.debug(`Failed to fetch sitemap with axios from ${sitemapUrl}: ${error}`);
+      logger.debug(`Failed to fetch sitemap with axios from ${sitemapUrl}: ${error}`);
       if (error instanceof AxiosError && error.response?.status === 404) {
         // ignore 404
       } else {
@@ -538,7 +408,7 @@ export class WebCrawler {
           sitemapLinks = await getLinksFromSitemap({ sitemapUrl: baseUrlSitemap, mode: 'fire-engine' });
         }
       } catch (error) {
-        Logger.debug(`Failed to fetch sitemap from ${baseUrlSitemap}: ${error}`);
+        logger.debug(`Failed to fetch sitemap from ${baseUrlSitemap}: ${error}`);
         if (error instanceof AxiosError && error.response?.status === 404) {
           // ignore 404
         } else {

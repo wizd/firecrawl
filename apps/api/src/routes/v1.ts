@@ -14,9 +14,10 @@ import expressWs from "express-ws";
 import { crawlStatusWSController } from "../controllers/v1/crawl-status-ws";
 import { isUrlBlocked } from "../scraper/WebScraper/utils/blocklist";
 import { crawlCancelController } from "../controllers/v1/crawl-cancel";
-import { Logger } from "../lib/logger";
+import { logger } from "../lib/logger";
 import { scrapeStatusController } from "../controllers/v1/scrape-status";
 import { concurrencyCheckController } from "../controllers/v1/concurrency-check";
+import { batchScrapeController } from "../controllers/v1/batch-scrape";
 // import { crawlPreviewController } from "../../src/controllers/v1/crawlPreview";
 // import { crawlJobStatusPreviewController } from "../../src/controllers/v1/status";
 // import { searchController } from "../../src/controllers/v1/search";
@@ -29,14 +30,16 @@ function checkCreditsMiddleware(minimum?: number): (req: RequestWithAuth, res: R
     return (req, res, next) => {
         (async () => {
             if (!minimum && req.body) {
-                minimum = (req.body as any)?.limit ?? 1;
+                minimum = (req.body as any)?.limit ?? (req.body as any)?.urls?.length ?? 1;
             }
-            const { success, remainingCredits, chunk } = await checkTeamCredits(req.acuc, req.auth.team_id, minimum);
-            req.acuc = chunk;
+            const { success, remainingCredits, chunk } = await checkTeamCredits(req.acuc, req.auth.team_id, minimum ?? 1);
+            if (chunk) {
+                req.acuc = chunk;
+            }
             if (!success) {
-                Logger.error(`Insufficient credits: ${JSON.stringify({ team_id: req.auth.team_id, minimum, remainingCredits })}`);
+                logger.error(`Insufficient credits: ${JSON.stringify({ team_id: req.auth.team_id, minimum, remainingCredits })}`);
                 if (!res.headersSent) {
-                    return res.status(402).json({ success: false, error: "Insufficient credits. For more credits, you can upgrade your plan at https://firecrawl.dev/pricing." });
+                    return res.status(402).json({ success: false, error: "Insufficient credits to perform this request. For more credits, you can upgrade your plan at https://firecrawl.dev/pricing or try changing the request limit to a lower value." });
                 }
             }
             req.account = { remainingCredits };
@@ -49,20 +52,27 @@ function checkCreditsMiddleware(minimum?: number): (req: RequestWithAuth, res: R
 export function authMiddleware(rateLimiterMode: RateLimiterMode): (req: RequestWithMaybeAuth, res: Response, next: NextFunction) => void {
     return (req, res, next) => {
         (async () => {
-            const { success, team_id, error, status, plan, chunk } = await authenticateUser(
+            const auth = await authenticateUser(
                 req,
                 res,
                 rateLimiterMode,
             );
 
-            if (!success) {
+            if (!auth.success) {
                 if (!res.headersSent) {
-                    return res.status(status).json({ success: false, error });
+                    return res.status(auth.status).json({ success: false, error: auth.error });
+                } else {
+                    return;
                 }
             }
 
+            const { team_id, plan, chunk } = auth;
+
             req.auth = { team_id, plan };
-            req.acuc = chunk;
+            req.acuc = chunk ?? undefined;
+            if (chunk) {
+                req.account = { remainingCredits: chunk.remaining_credits };
+            }
             next();
         })()
             .catch(err => next(err));
@@ -94,7 +104,7 @@ function blocklistMiddleware(req: Request, res: Response, next: NextFunction) {
     next();
 }
 
-function wrap(controller: (req: Request, res: Response) => Promise<any>): (req: Request, res: Response, next: NextFunction) => any {
+export function wrap(controller: (req: Request, res: Response) => Promise<any>): (req: Request, res: Response, next: NextFunction) => any {
     return (req, res, next) => {
         controller(req, res)
             .catch(err => next(err))
@@ -123,6 +133,15 @@ v1Router.post(
 );
 
 v1Router.post(
+    "/batch/scrape",
+    authMiddleware(RateLimiterMode.Crawl),
+    checkCreditsMiddleware(),
+    blocklistMiddleware,
+    idempotencyMiddleware,
+    wrap(batchScrapeController)
+);
+
+v1Router.post(
     "/map",
     authMiddleware(RateLimiterMode.Map),
     checkCreditsMiddleware(1),
@@ -134,6 +153,13 @@ v1Router.get(
     "/crawl/:jobId",
     authMiddleware(RateLimiterMode.CrawlStatus),
     wrap(crawlStatusController)
+);
+
+v1Router.get(
+    "/batch/scrape/:jobId",
+    authMiddleware(RateLimiterMode.CrawlStatus),
+    // Yes, it uses the same controller as the normal crawl status controller
+    wrap((req:any, res):any => crawlStatusController(req, res, true))
 );
 
 v1Router.get(

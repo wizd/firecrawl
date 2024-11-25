@@ -1,7 +1,7 @@
 import request from "supertest";
 import { configDotenv } from "dotenv";
 import {
-  ScrapeRequest,
+  ScrapeRequestInput,
   ScrapeResponseRequestTest,
 } from "../../controllers/v1/types";
 
@@ -44,7 +44,7 @@ describe("E2E Tests for v1 API Routes", () => {
     });
 
     it.concurrent("should throw error for blocklisted URL", async () => {
-      const scrapeRequest: ScrapeRequest = {
+      const scrapeRequest: ScrapeRequestInput = {
         url: "https://facebook.com/fake-test",
       };
 
@@ -73,7 +73,7 @@ describe("E2E Tests for v1 API Routes", () => {
     it.concurrent(
       "should return a successful response with a valid API key",
       async () => {
-        const scrapeRequest: ScrapeRequest = {
+        const scrapeRequest: ScrapeRequestInput = {
           url: "https://roastmywebsite.ai",
         };
 
@@ -121,10 +121,53 @@ describe("E2E Tests for v1 API Routes", () => {
       },
       30000
     ); // 30 seconds timeout
+
+    it.concurrent(
+      "should return a successful response with a valid API key",
+      async () => {
+        const scrapeRequest: ScrapeRequestInput = {
+          url: "https://arxiv.org/abs/2410.04840",
+        };
+
+        const response: ScrapeResponseRequestTest = await request(TEST_URL)
+          .post("/v1/scrape")
+          .set("Authorization", `Bearer ${process.env.TEST_API_KEY}`)
+          .set("Content-Type", "application/json")
+          .send(scrapeRequest);
+
+        expect(response.statusCode).toBe(200);
+
+        if (!("data" in response.body)) {
+          throw new Error("Expected response body to have 'data' property");
+        }
+        expect(response.body.data).not.toHaveProperty("content");
+        expect(response.body.data).toHaveProperty("markdown");
+        expect(response.body.data).toHaveProperty("metadata");
+        expect(response.body.data).not.toHaveProperty("html");
+        expect(response.body.data.markdown).toContain("Strong Model Collapse");
+        expect(response.body.data.metadata.error).toBeUndefined();
+        expect(response.body.data.metadata.description).toContain("Abstract page for arXiv paper 2410.04840: Strong Model Collapse");
+        expect(response.body.data.metadata.citation_title).toBe("Strong Model Collapse");
+        expect(response.body.data.metadata.citation_author).toEqual([
+          "Dohmatob, Elvis",
+          "Feng, Yunzhen",
+          "Subramonian, Arjun",
+          "Kempe, Julia"
+        ]);
+        expect(response.body.data.metadata.citation_date).toBe("2024/10/07");
+        expect(response.body.data.metadata.citation_online_date).toBe("2024/10/08");
+        expect(response.body.data.metadata.citation_pdf_url).toBe("http://arxiv.org/pdf/2410.04840");
+        expect(response.body.data.metadata.citation_arxiv_id).toBe("2410.04840");
+        expect(response.body.data.metadata.citation_abstract).toContain("Within the scaling laws paradigm");
+        expect(response.body.data.metadata.sourceURL).toBe("https://arxiv.org/abs/2410.04840");
+        expect(response.body.data.metadata.statusCode).toBe(200);
+      },
+      30000
+    );
     it.concurrent(
       "should return a successful response with a valid API key and includeHtml set to true",
       async () => {
-        const scrapeRequest: ScrapeRequest = {
+        const scrapeRequest: ScrapeRequestInput = {
           url: "https://roastmywebsite.ai",
           formats: ["markdown", "html"],
         };
@@ -151,7 +194,7 @@ describe("E2E Tests for v1 API Routes", () => {
       30000
     );
     it.concurrent('should return a successful response for a valid scrape with PDF file', async () => {
-        const scrapeRequest: ScrapeRequest = {
+        const scrapeRequest: ScrapeRequestInput = {
           url: "https://arxiv.org/pdf/astro-ph/9301001.pdf"
         //   formats: ["markdown", "html"],
         };
@@ -174,7 +217,7 @@ describe("E2E Tests for v1 API Routes", () => {
       }, 60000);
 
       it.concurrent('should return a successful response for a valid scrape with PDF file without explicit .pdf extension', async () => {
-        const scrapeRequest: ScrapeRequest = {
+        const scrapeRequest: ScrapeRequestInput = {
           url: "https://arxiv.org/pdf/astro-ph/9301001"
         };
         const response: ScrapeResponseRequestTest = await request(TEST_URL)
@@ -197,7 +240,7 @@ describe("E2E Tests for v1 API Routes", () => {
       }, 60000);
 
       it.concurrent("should return a successful response with a valid API key with removeTags option", async () => {
-        const scrapeRequest: ScrapeRequest = {
+        const scrapeRequest: ScrapeRequestInput = {
           url: "https://www.scrapethissite.com/",
           onlyMainContent: false // default is true
         };
@@ -218,7 +261,7 @@ describe("E2E Tests for v1 API Routes", () => {
         expect(responseWithoutRemoveTags.body.data.markdown).toContain("[FAQ](/faq/)"); // .nav
         expect(responseWithoutRemoveTags.body.data.markdown).toContain("Hartley Brody 2023"); // #footer
   
-        const scrapeRequestWithRemoveTags: ScrapeRequest = {
+        const scrapeRequestWithRemoveTags: ScrapeRequestInput = {
             url: "https://www.scrapethissite.com/",
             excludeTags: ['.nav', '#footer', 'strong'],
             onlyMainContent: false // default is true
@@ -364,7 +407,7 @@ describe("E2E Tests for v1 API Routes", () => {
       it.concurrent(
         "should return a successful response with a valid API key and includeHtml set to true",
         async () => {
-          const scrapeRequest: ScrapeRequest = {
+          const scrapeRequest: ScrapeRequestInput = {
             url: "https://roastmywebsite.ai",
             formats: ["html","rawHtml"],
           };
@@ -395,7 +438,7 @@ describe("E2E Tests for v1 API Routes", () => {
       it.concurrent(
         "should return a successful response with waitFor",
         async () => {
-          const scrapeRequest: ScrapeRequest = {
+          const scrapeRequest: ScrapeRequestInput = {
             url: "https://ycombinator.com/companies",
             formats: ["markdown"],
             waitFor: 8000
@@ -428,7 +471,7 @@ describe("E2E Tests for v1 API Routes", () => {
       it.concurrent(
         "should return a successful response with a valid links on page",
         async () => {
-          const scrapeRequest: ScrapeRequest = {
+          const scrapeRequest: ScrapeRequestInput = {
             url: "https://roastmywebsite.ai",
             formats: ["links"],
           };
@@ -629,7 +672,7 @@ describe("POST /v1/crawl", () => {
   });
   
   it.concurrent("should throw error for blocklisted URL", async () => {
-    const scrapeRequest: ScrapeRequest = {
+    const scrapeRequest: ScrapeRequestInput = {
       url: "https://facebook.com/fake-test",
     };
 
@@ -825,7 +868,7 @@ describe("POST /v1/crawl", () => {
       const urls = completedResponse.body.data.map(
         (item: any) => item.metadata?.sourceURL
       );
-      expect(urls.length).toBeGreaterThanOrEqual(1);
+      expect(urls.length).toBeGreaterThan(1);
 
       // Check if all URLs have a maximum depth of 1
       urls.forEach((url: string) => {

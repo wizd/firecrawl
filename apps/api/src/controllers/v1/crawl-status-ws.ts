@@ -1,14 +1,15 @@
 import { authMiddleware } from "../../routes/v1";
 import { RateLimiterMode } from "../../types";
 import { authenticateUser } from "../auth";
-import { CrawlStatusParams, CrawlStatusResponse, Document, ErrorResponse, legacyDocumentConverter, RequestWithAuth } from "./types";
+import { CrawlStatusParams, CrawlStatusResponse, Document, ErrorResponse, RequestWithAuth } from "./types";
 import { WebSocket } from "ws";
 import { v4 as uuidv4 } from "uuid";
-import { Logger } from "../../lib/logger";
+import { logger } from "../../lib/logger";
 import { getCrawl, getCrawlExpiry, getCrawlJobs, getDoneJobsOrdered, getDoneJobsOrderedLength, getThrottledJobs, isCrawlFinished, isCrawlFinishedLocked } from "../../lib/crawl-redis";
 import { getScrapeQueue } from "../../services/queue-service";
 import { getJob, getJobs } from "./crawl-status";
 import * as Sentry from "@sentry/node";
+import { Job, JobState } from "bullmq";
 
 type ErrorMessage = {
   type: "error",
@@ -56,7 +57,7 @@ async function crawlStatusWS(ws: WebSocket, req: RequestWithAuth<CrawlStatusPara
     return close(ws, 3003, { type: "error", error: "Forbidden" });
   }
 
-  let doneJobIDs = [];
+  let doneJobIDs: string[] = [];
   let finished = false;
 
   const loop = async () => {
@@ -70,15 +71,14 @@ async function crawlStatusWS(ws: WebSocket, req: RequestWithAuth<CrawlStatusPara
 
     const notDoneJobIDs = jobIDs.filter(x => !doneJobIDs.includes(x));
     const jobStatuses = await Promise.all(notDoneJobIDs.map(async x => [x, await getScrapeQueue().getJobState(x)]));
-    const newlyDoneJobIDs = jobStatuses.filter(x => x[1] === "completed" || x[1] === "failed").map(x => x[0]);
+    const newlyDoneJobIDs: string[] = jobStatuses.filter(x => x[1] === "completed" || x[1] === "failed").map(x => x[0]);
+    const newlyDoneJobs: Job[] = (await Promise.all(newlyDoneJobIDs.map(x => getJob(x)))).filter(x => x !== undefined) as Job[]
 
-    for (const jobID of newlyDoneJobIDs) {
-      const job = await getJob(jobID);
-
+    for (const job of newlyDoneJobs) {
       if (job.returnvalue) {
         send(ws, {
           type: "document",
-          data: legacyDocumentConverter(job.returnvalue),
+          data: job.returnvalue,
         })
       } else {
         return close(ws, 3000, { type: "error", error: job.failedReason });
@@ -97,12 +97,23 @@ async function crawlStatusWS(ws: WebSocket, req: RequestWithAuth<CrawlStatusPara
   let jobIDs = await getCrawlJobs(req.params.jobId);
   let jobStatuses = await Promise.all(jobIDs.map(async x => [x, await getScrapeQueue().getJobState(x)] as const));
   const throttledJobs = new Set(...await getThrottledJobs(req.auth.team_id));
-  jobStatuses = jobStatuses.filter(x => !throttledJobs.has(x[0])); // throttled jobs can have a failed status, but they are not actually failed
-  // filter out failed jobs
-  jobIDs = jobIDs.filter(id => !jobStatuses.some(status => status[0] === id && status[1] === "failed"));
-  // filter the job statues
-  jobStatuses = jobStatuses.filter(x => x[1] !== "failed");
-  const status: Exclude<CrawlStatusResponse, ErrorResponse>["status"] = sc.cancelled ? "cancelled" : jobStatuses.every(x => x[1] === "completed") ? "completed" : "scraping";
+
+  const throttledJobsSet = new Set(throttledJobs);
+
+  const validJobStatuses: [string, JobState | "unknown"][] = [];
+  const validJobIDs: string[] = [];
+
+  for (const [id, status] of jobStatuses) {
+    if (!throttledJobsSet.has(id) && status !== "failed" && status !== "unknown") {
+      validJobStatuses.push([id, status]);
+      validJobIDs.push(id);
+    }
+  }
+
+  const status: Exclude<CrawlStatusResponse, ErrorResponse>["status"] = sc.cancelled ? "cancelled" : validJobStatuses.every(x => x[1] === "completed") ? "completed" : "scraping";
+
+  jobIDs = validJobIDs; // Use validJobIDs instead of jobIDs for further processing
+
   const doneJobs = await getJobs(doneJobIDs);
   const data = doneJobs.map(x => x.returnvalue);
 
@@ -115,7 +126,7 @@ async function crawlStatusWS(ws: WebSocket, req: RequestWithAuth<CrawlStatusPara
       completed: doneJobIDs.length,
       creditsUsed: jobIDs.length,
       expiresAt: (await getCrawlExpiry(req.params.jobId)).toISOString(),
-      data: data.map(x => legacyDocumentConverter(x)),
+      data: data,
     }
   });
 
@@ -128,18 +139,20 @@ async function crawlStatusWS(ws: WebSocket, req: RequestWithAuth<CrawlStatusPara
 // Basically just middleware and error wrapping
 export async function crawlStatusWSController(ws: WebSocket, req: RequestWithAuth<CrawlStatusParams, undefined, undefined>) {
   try {
-    const { success, team_id, error, status, plan } = await authenticateUser(
+    const auth = await authenticateUser(
       req,
       null,
       RateLimiterMode.CrawlStatus,
     );
 
-    if (!success) {
+    if (!auth.success) {
       return close(ws, 3000, {
         type: "error",
-        error,
+        error: auth.error,
       });
     }
+
+    const { team_id, plan } = auth;
 
     req.auth = { team_id, plan };
 
@@ -159,10 +172,10 @@ export async function crawlStatusWSController(ws: WebSocket, req: RequestWithAut
       }
     }
 
-    Logger.error("Error occurred in WebSocket! (" + req.path + ") -- ID " + id + " -- " + verbose);
+    logger.error("Error occurred in WebSocket! (" + req.path + ") -- ID " + id + " -- " + verbose);
     return close(ws, 1011, {
       type: "error",
-      error: "An unexpected error occurred. Please contact hello@firecrawl.com for help. Your exception ID is " + id
+      error: "An unexpected error occurred. Please contact help@firecrawl.com for help. Your exception ID is " + id
     });
   }
 }

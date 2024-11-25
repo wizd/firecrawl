@@ -1,16 +1,17 @@
 import axios from "axios";
-import { legacyDocumentConverter } from "../../src/controllers/v1/types";
-import { Logger } from "../../src/lib/logger";
+import { logger } from "../lib/logger";
 import { supabase_service } from "./supabase";
 import { WebhookEventType } from "../types";
 import { configDotenv } from "dotenv";
+import { z } from "zod";
+import { webhookSchema } from "../controllers/v1/types";
 configDotenv();
 
 export const callWebhook = async (
   teamId: string,
   id: string,
   data: any | null,
-  specified?: string,
+  specified?: z.infer<typeof webhookSchema>,
   v1 = false,
   eventType: WebhookEventType = "crawl.page",
   awaitWebhook: boolean = false
@@ -21,7 +22,7 @@ export const callWebhook = async (
       id
     );
     const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";
-    let webhookUrl = specified ?? selfHostedUrl;
+    let webhookUrl = specified ?? (selfHostedUrl ? webhookSchema.parse({ url: selfHostedUrl }) : undefined);
 
     // Only fetch the webhook URL from the database if the self-hosted webhook URL and specified webhook are not set
     // and the USE_DB_AUTHENTICATION environment variable is set to true
@@ -32,7 +33,7 @@ export const callWebhook = async (
         .eq("team_id", teamId)
         .limit(1);
       if (error) {
-        Logger.error(
+        logger.error(
           `Error fetching webhook URL for team ID: ${teamId}, error: ${error.message}`
         );
         return null;
@@ -45,7 +46,13 @@ export const callWebhook = async (
       webhookUrl = webhooksData[0].url;
     }
 
-    let dataToSend = [];
+    logger.debug("Calling webhook...", { webhookUrl, teamId, specified, v1, eventType, awaitWebhook });
+
+    if (!webhookUrl) {
+      return null;
+    }
+
+    let dataToSend: any[] = [];
     if (
       data &&
       data.result &&
@@ -55,7 +62,7 @@ export const callWebhook = async (
       for (let i = 0; i < data.result.links.length; i++) {
         if (v1) {
           dataToSend.push(
-            legacyDocumentConverter(data.result.links[i].content)
+            data.result.links[i].content
           );
         } else {
           dataToSend.push({
@@ -70,7 +77,7 @@ export const callWebhook = async (
     if (awaitWebhook) {
       try {
         await axios.post(
-          webhookUrl,
+          webhookUrl.url,
           {
             success: !v1
               ? data.success
@@ -89,19 +96,20 @@ export const callWebhook = async (
           {
             headers: {
               "Content-Type": "application/json",
+              ...webhookUrl.headers,
             },
             timeout: v1 ? 10000 : 30000, // 10 seconds timeout (v1)
           }
         );
       } catch (error) {
-        Logger.error(
+        logger.error(
           `Axios error (0) sending webhook for team ID: ${teamId}, error: ${error.message}`
         );
       }
     } else {
       axios
         .post(
-          webhookUrl,
+          webhookUrl.url,
           {
             success: !v1
               ? data.success
@@ -120,18 +128,18 @@ export const callWebhook = async (
           {
             headers: {
               "Content-Type": "application/json",
+              ...webhookUrl.headers,
             },
-            timeout: v1 ? 10000 : 30000, // 10 seconds timeout (v1)
           }
         )
         .catch((error) => {
-          Logger.error(
+          logger.error(
             `Axios error sending webhook for team ID: ${teamId}, error: ${error.message}`
           );
         });
     }
   } catch (error) {
-    Logger.debug(
+    logger.debug(
       `Error sending webhook for team ID: ${teamId}, error: ${error.message}`
     );
   }

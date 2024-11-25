@@ -5,23 +5,29 @@ import "../services/sentry"
 import * as Sentry from "@sentry/node";
 
 import dotenv from 'dotenv';
-import { Logger } from './logger';
+import { logger } from './logger';
+import { stat } from 'fs/promises';
 dotenv.config();
 
 // TODO: add a timeout to the Go parser
+const goExecutablePath = join(process.cwd(), 'sharedLibs', 'go-html-to-md', 'html-to-markdown.so');
 
 class GoMarkdownConverter {
   private static instance: GoMarkdownConverter;
   private convert: any;
 
   private constructor() {
-    const goExecutablePath = join(__dirname, 'go-html-to-md/html-to-markdown.so');
     const lib = koffi.load(goExecutablePath);
     this.convert = lib.func('ConvertHTMLToMarkdown', 'string', ['string']);
   }
 
-  public static getInstance(): GoMarkdownConverter {
+  public static async getInstance(): Promise<GoMarkdownConverter> {
     if (!GoMarkdownConverter.instance) {
+      try {
+        await stat(goExecutablePath);
+      } catch (_) {
+        throw Error("Go shared library not found");
+      }
       GoMarkdownConverter.instance = new GoMarkdownConverter();
     }
     return GoMarkdownConverter.instance;
@@ -40,24 +46,28 @@ class GoMarkdownConverter {
   }
 }
 
-export async function parseMarkdown(html: string): Promise<string> {
+export async function parseMarkdown(html: string | null | undefined): Promise<string> {
   if (!html) {
     return '';
   }
 
   try {
     if (process.env.USE_GO_MARKDOWN_PARSER == "true") {
-      const converter = GoMarkdownConverter.getInstance();
+      const converter = await GoMarkdownConverter.getInstance();
       let markdownContent = await converter.convertHTMLToMarkdown(html);
 
       markdownContent = processMultiLineLinks(markdownContent);
       markdownContent = removeSkipToContentLinks(markdownContent);
-      Logger.info(`HTML to Markdown conversion using Go parser successful`);
+      logger.info(`HTML to Markdown conversion using Go parser successful`);
       return markdownContent;
     }
   } catch (error) {
-    Sentry.captureException(error);
-    Logger.error(`Error converting HTML to Markdown with Go parser: ${error}`);
+    if (!(error instanceof Error) || error.message !== "Go shared library not found") {
+      Sentry.captureException(error);
+      logger.error(`Error converting HTML to Markdown with Go parser: ${error}`);
+    } else {
+      logger.warn("Tried to use Go parser, but it doesn't exist in the file system.", { goExecutablePath });
+    }
   }
 
   // Fallback to TurndownService if Go parser fails or is not enabled
@@ -89,7 +99,7 @@ export async function parseMarkdown(html: string): Promise<string> {
 
     return markdownContent;
   } catch (error) {
-    console.error("Error converting HTML to Markdown: ", error);
+    logger.error("Error converting HTML to Markdown", {error});
     return ""; // Optionally return an empty string or handle the error as needed
   }
 }

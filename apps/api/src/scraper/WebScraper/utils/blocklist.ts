@@ -1,4 +1,4 @@
-import { Logger } from "../../../lib/logger";
+import { logger } from "../../../lib/logger";
 
 const socialMediaBlocklist = [
   'facebook.com',
@@ -40,6 +40,7 @@ const allowedKeywords = [
   'tos',
   '://ads.tiktok.com',
   '://tiktok.com/business',
+  '://developers.facebook.com'
 ];
 
 export function isUrlBlocked(url: string): boolean {
@@ -67,7 +68,7 @@ export function isUrlBlocked(url: string): boolean {
     return isBlocked;
   } catch (e) {
     // If an error occurs (e.g., invalid URL), return false
-    Logger.error(`Error parsing the following URL: ${url}`);
+    logger.error(`Error parsing the following URL: ${url}`);
     return false;
   }
 }

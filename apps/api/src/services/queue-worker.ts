@@ -7,13 +7,11 @@ import {
   redisConnection,
   scrapeQueueName,
 } from "./queue-service";
-import { logtail } from "./logtail";
 import { startWebScraperPipeline } from "../main/runWebScraper";
 import { callWebhook } from "./webhook";
 import { logJob } from "./logging/log_job";
-import { initSDK } from "@hyperdx/node-opentelemetry";
 import { Job, Queue } from "bullmq";
-import { Logger } from "../lib/logger";
+import { logger } from "../lib/logger";
 import { Worker } from "bullmq";
 import systemMonitor from "./system-monitor";
 import { v4 as uuidv4 } from "uuid";
@@ -25,27 +23,23 @@ import {
   getCrawl,
   getCrawlJobs,
   lockURL,
+  normalizeURL,
 } from "../lib/crawl-redis";
 import { StoredCrawl } from "../lib/crawl-redis";
 import { addScrapeJob } from "./queue-jobs";
-import { supabaseGetJobById } from "../../src/lib/supabase-jobs";
 import {
   addJobPriority,
   deleteJobPriority,
   getJobPriority,
 } from "../../src/lib/job-priority";
 import { PlanType, RateLimiterMode } from "../types";
-import { getJobs } from "../../src/controllers/v1/crawl-status";
+import { getJobs } from "..//controllers/v1/crawl-status";
 import { configDotenv } from "dotenv";
+import { scrapeOptions } from "../controllers/v1/types";
 import { getRateLimiterPoints } from "./rate-limiter";
+import { cleanOldConcurrencyLimitEntries, pushConcurrencyLimitActiveJob, removeConcurrencyLimitActiveJob, takeConcurrencyLimitedJob } from "../lib/concurrency-limit";
 configDotenv();
 
-if (process.env.ENV === "production") {
-  initSDK({
-    consoleCapture: true,
-    additionalInstrumentations: [],
-  });
-}
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const workerLockDuration = Number(process.env.WORKER_LOCK_DURATION) || 60000;
@@ -62,9 +56,9 @@ const connectionMonitorInterval =
   Number(process.env.CONNECTION_MONITOR_INTERVAL) || 10;
 const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
 
-const processJobInternal = async (token: string, job: Job) => {
+const processJobInternal = async (token: string, job: Job & { id: string }) => {
   const extendLockInterval = setInterval(async () => {
-    Logger.info(`🐂 Worker extending lock on job ${job.id}`);
+    logger.info(`🐂 Worker extending lock on job ${job.id}`);
     await job.extendLock(token, jobLockExtensionTime);
   }, jobLockExtendInterval);
 
@@ -72,13 +66,18 @@ const processJobInternal = async (token: string, job: Job) => {
   let err = null;
   try {
     const result = await processJob(job, token);
-    try {
-      if (job.data.crawl_id && process.env.USE_DB_AUTHENTICATION === "true") {
-        await job.moveToCompleted(null, token, false);
-      } else {
-        await job.moveToCompleted(result.docs, token, false);
-      }
-    } catch (e) {}
+    if (result.success) {
+      try {
+        if (job.data.crawl_id && process.env.USE_DB_AUTHENTICATION === "true") {
+          await job.moveToCompleted(null, token, false);
+        } else {
+          await job.moveToCompleted(result.document, token, false);
+        }
+      } catch (e) {}
+    } else {
+      await job.moveToFailed((result as any).error, token, false);
+    }
+    
   } catch (error) {
     console.log("Job failed, error:", error);
     Sentry.captureException(error);
@@ -103,6 +102,8 @@ process.on("SIGTERM", () => {
   console.log("Received SIGTERM. Shutting down gracefully...");
   isShuttingDown = true;
 });
+
+let cantAcceptConnectionCount = 0;
 
 const workerFun = async (
   queue: Queue,
@@ -129,52 +130,44 @@ const workerFun = async (
     const canAcceptConnection = await monitor.acceptConnection();
     if (!canAcceptConnection) {
       console.log("Cant accept connection");
+      cantAcceptConnectionCount++;
+
+      if (cantAcceptConnectionCount >= 25) {
+        logger.error("WORKER STALLED", {
+          cpuUsage: await monitor.checkCpuUsage(),
+          memoryUsage: await monitor.checkMemoryUsage(),
+        });
+      }
+
       await sleep(cantAcceptConnectionInterval); // more sleep
       continue;
+    } else {
+      cantAcceptConnectionCount = 0;
     }
 
     const job = await worker.getNextJob(token);
     if (job) {
-      const concurrencyLimiterKey = "concurrency-limiter:" + job.data?.team_id;
+      async function afterJobDone(job: Job<any, any, string>) {
+        if (job.id && job.data && job.data.team_id && job.data.plan) {
+          await removeConcurrencyLimitActiveJob(job.data.team_id, job.id);
+          cleanOldConcurrencyLimitEntries(job.data.team_id);
 
-      if (job.data && job.data.team_id && job.data.plan) {
-        const concurrencyLimiterThrottledKey = "concurrency-limiter:" + job.data.team_id + ":throttled";
-        const concurrencyLimit = getRateLimiterPoints(RateLimiterMode.Scrape, undefined, job.data.plan);
-        const now = Date.now();
-        const stalledJobTimeoutMs = 2 * 60 * 1000;
-        const throttledJobTimeoutMs = 10 * 60 * 1000;
+          // Queue up next job, if it exists
+          // No need to check if we're under the limit here -- if the current job is finished,
+          // we are 1 under the limit, assuming the job insertion logic never over-inserts. - MG
+          const nextJob = await takeConcurrencyLimitedJob(job.data.team_id);
+          if (nextJob !== null) {
+            await pushConcurrencyLimitActiveJob(job.data.team_id, nextJob.id);
 
-        redisConnection.zremrangebyscore(concurrencyLimiterThrottledKey, -Infinity, now);
-        redisConnection.zremrangebyscore(concurrencyLimiterKey, -Infinity, now);
-        const activeJobsOfTeam = await redisConnection.zrangebyscore(concurrencyLimiterKey, now, Infinity);
-        if (activeJobsOfTeam.length >= concurrencyLimit) {
-          // Nick: removed the log because it was too spammy, tested and confirmed that the job is added back to the queue
-          // Logger.info("Moving job " + job.id + " back the queue -- concurrency limit hit");
-          // Concurrency limit hit, throttles the job
-          await redisConnection.zadd(concurrencyLimiterThrottledKey, now + throttledJobTimeoutMs, job.id);
-          // We move to failed with a specific error
-          await job.moveToFailed(new Error("Concurrency limit hit"), token, false);
-          // Remove the job from the queue
-          await job.remove();
-          // Increment the priority of the job exponentially by 5%, Note: max bull priority is 2 million
-          const newJobPriority = Math.min(Math.round((job.opts.priority ?? 10) * 1.05), 20000);
-          // Add the job back to the queue with the new priority
-          await queue.add(job.name, {
-            ...job.data,
-            concurrencyLimitHit: true,
-          }, {
-            ...job.opts,
-            jobId: job.id,
-            priority: newJobPriority, // exponential backoff for stuck jobs
-          });
-
-          // await sleep(gotJobInterval);
-          continue;
-        } else {
-          // If we are not throttled, add the job back to the queue with the new priority
-          await redisConnection.zadd(concurrencyLimiterKey, now + stalledJobTimeoutMs, job.id);
-          // Remove the job from the throttled list
-          await redisConnection.zrem(concurrencyLimiterThrottledKey, job.id);
+            await queue.add(nextJob.id, {
+              ...nextJob.data,
+              concurrencyLimitHit: true,
+            }, {
+              ...nextJob.opts,
+              jobId: nextJob.id,
+              priority: nextJob.priority,
+            });
+          }
         }
       }
 
@@ -212,9 +205,7 @@ const workerFun = async (
                     try {
                       res = await processJobInternal(token, job);
                     } finally { 
-                      if (job.id && job.data && job.data.team_id) {
-                        await redisConnection.zrem(concurrencyLimiterKey, job.id);
-                      }
+                      await afterJobDone(job)
                     }
                     
                     if (res !== null) {
@@ -239,11 +230,7 @@ const workerFun = async (
           },
           () => {
             processJobInternal(token, job)
-              .finally(() => {
-                if (job.id && job.data && job.data.team_id) {
-                  redisConnection.zrem(concurrencyLimiterKey, job.id);
-                }
-              });
+              .finally(() => afterJobDone(job));
           }
         );
       }
@@ -257,8 +244,8 @@ const workerFun = async (
 
 workerFun(getScrapeQueue(), processJobInternal);
 
-async function processJob(job: Job, token: string) {
-  Logger.info(`🐂 Worker taking job ${job.id}`);
+async function processJob(job: Job & { id: string }, token: string) {
+  logger.info(`🐂 Worker taking job ${job.id}`);
 
   // Check if the job URL is researchhub and block it immediately
   // TODO: remove this once solve the root issue
@@ -269,15 +256,14 @@ async function processJob(job: Job, token: string) {
       job.data.url.includes("youtube.com") ||
       job.data.url.includes("microsoft.com"))
   ) {
-    Logger.info(`🐂 Blocking job ${job.id} with URL ${job.data.url}`);
+    logger.info(`🐂 Blocking job ${job.id} with URL ${job.data.url}`);
     const data = {
       success: false,
-      docs: [],
+      document: null,
       project_id: job.data.project_id,
       error:
-        "URL is blocked. Suspecious activity detected. Please contact hello@firecrawl.com if you believe this is an error.",
+        "URL is blocked. Suspecious activity detected. Please contact help@firecrawl.com if you believe this is an error.",
     };
-    await job.moveToCompleted(data.docs, token, false);
     return data;
   }
 
@@ -290,48 +276,43 @@ async function processJob(job: Job, token: string) {
     });
     const start = Date.now();
 
-    const { success, message, docs } = await startWebScraperPipeline({
-      job,
-      token,
-    });
+    const pipeline = await Promise.race([
+      startWebScraperPipeline({
+        job,
+        token,
+      }),
+      ...(job.data.scrapeOptions.timeout !== undefined ? [
+        (async () => {
+          await sleep(job.data.scrapeOptions.timeout);
+          throw new Error("timeout")
+        })(),
+      ] : [])
+    ]);
 
-    // Better if we throw here so we capture with the correct error
-    if (!success) {
-      throw new Error(message);
+    if (!pipeline.success) {
+      // TODO: let's Not do this
+      throw pipeline.error;
     }
+
     const end = Date.now();
     const timeTakenInSeconds = (end - start) / 1000;
 
-    const rawHtml = docs[0] ? docs[0].rawHtml : "";
+    const doc = pipeline.document;
+
+    const rawHtml = doc.rawHtml ?? "";
 
     const data = {
-      success,
+      success: true,
       result: {
-        links: docs.map((doc) => {
-          return {
-            content: doc,
-            source: doc?.metadata?.sourceURL ?? doc?.url ?? "",
-          };
-        }),
+        links: [{
+          content: doc,
+          source: doc?.metadata?.sourceURL ?? doc?.metadata?.url ?? "",
+        }],
       },
       project_id: job.data.project_id,
-      error: message /* etc... */,
-      docs: job.data.concurrencyLimitHit ? docs.map(x => ({
-        ...x,
-        warning: "This scrape was throttled because you hit you concurrency limit." + (x.warning ? " " + x.warning : ""),
-      })) : docs,
+      document: doc,
     };
 
-    // No idea what this does and when it is called.
-    if (job.data.mode === "crawl" && !job.data.v1) {
-      callWebhook(
-        job.data.team_id,
-        job.id as string,
-        data,
-        job.data.webhook,
-        job.data.v1
-      );
-    }
     if (job.data.webhook && job.data.mode !== "crawl" && job.data.v1) {
       await callWebhook(
         job.data.team_id,
@@ -339,38 +320,42 @@ async function processJob(job: Job, token: string) {
         data,
         job.data.webhook,
         job.data.v1,
-        "crawl.page",
+        job.data.crawlerOptions !== null ? "crawl.page" : "batch_scrape.page",
         true
       );
     }
 
     if (job.data.crawl_id) {
+      const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
+    
+      if (doc.metadata.url !== undefined && doc.metadata.sourceURL !== undefined && normalizeURL(doc.metadata.url, sc) !== normalizeURL(doc.metadata.sourceURL, sc)) {
+        logger.debug("Was redirected, locking new URL...");
+        await lockURL(job.data.crawl_id, sc, doc.metadata.url);
+      }
+
       await logJob({
         job_id: job.id as string,
-        success: success,
-        message: message,
-        num_docs: docs.length,
-        docs: docs,
+        success: true,
+        num_docs: 1,
+        docs: [doc],
         time_taken: timeTakenInSeconds,
         team_id: job.data.team_id,
         mode: job.data.mode,
         url: job.data.url,
-        crawlerOptions: job.data.crawlerOptions,
-        pageOptions: job.data.pageOptions,
+        crawlerOptions: sc.crawlerOptions,
+        scrapeOptions: job.data.scrapeOptions,
         origin: job.data.origin,
         crawl_id: job.data.crawl_id,
-      });
+      }, true);
 
       await addCrawlJobDone(job.data.crawl_id, job.id);
 
-      const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
-
-      if (!job.data.sitemapped) {
+      if (job.data.crawlerOptions !== null) {
         if (!sc.cancelled) {
-          const crawler = crawlToCrawler(job.data.crawl_id, sc);
+          const crawler = crawlToCrawler(job.data.crawl_id, sc, doc.metadata.url ?? doc.metadata.sourceURL ?? sc.originUrl!);
 
           const links = crawler.filterLinks(
-            crawler.extractLinksFromHTML(rawHtml ?? "", sc.originUrl),
+            crawler.extractLinksFromHTML(rawHtml ?? "", doc.metadata?.url ?? doc.metadata?.sourceURL ?? sc.originUrl!),
             Infinity,
             sc.crawlerOptions?.maxDepth ?? 10
           );
@@ -390,14 +375,14 @@ async function processJob(job: Job, token: string) {
               // console.log("base priority: ", job.data.crawl_id ? 20 : 10)
               // console.log("job priority: " , jobPriority, "\n\n\n")
 
-              const newJob = await addScrapeJob(
+              await addScrapeJob(
                 {
                   url: link,
                   mode: "single_urls",
-                  crawlerOptions: sc.crawlerOptions,
                   team_id: sc.team_id,
+                  scrapeOptions: scrapeOptions.parse(sc.scrapeOptions),
+                  internalOptions: sc.internalOptions,
                   plan: job.data.plan,
-                  pageOptions: sc.pageOptions,
                   origin: job.data.origin,
                   crawl_id: job.data.crawl_id,
                   webhook: job.data.webhook,
@@ -408,15 +393,13 @@ async function processJob(job: Job, token: string) {
                 jobPriority
               );
 
-              await addCrawlJob(job.data.crawl_id, newJob.id);
+              await addCrawlJob(job.data.crawl_id, jobId);
             }
           }
         }
       }
 
       if (await finishCrawl(job.data.crawl_id)) {
-        
-
         if (!job.data.v1) {
           const jobIDs = await getCrawlJobs(job.data.crawl_id);
 
@@ -434,15 +417,15 @@ async function processJob(job: Job, token: string) {
           await logJob({
             job_id: job.data.crawl_id,
             success: jobStatus === "completed",
-            message: sc.cancelled ? "Cancelled" : message,
+            message: sc.cancelled ? "Cancelled" : undefined,
             num_docs: fullDocs.length,
             docs: [],
             time_taken: (Date.now() - sc.createdAt) / 1000,
             team_id: job.data.team_id,
-            mode: "crawl",
-            url: sc.originUrl,
+            mode: job.data.crawlerOptions !== null ? "crawl" : "batch_scrape",
+            url: sc.originUrl!,
+            scrapeOptions: sc.scrapeOptions,
             crawlerOptions: sc.crawlerOptions,
-            pageOptions: sc.pageOptions,
             origin: job.data.origin,
           });
 
@@ -457,7 +440,6 @@ async function processJob(job: Job, token: string) {
               }),
             },
             project_id: job.data.project_id,
-            error: message /* etc... */,
             docs: fullDocs,
           };
 
@@ -469,7 +451,7 @@ async function processJob(job: Job, token: string) {
               data,
               job.data.webhook,
               job.data.v1,
-              "crawl.completed"
+              job.data.crawlerOptions !== null ? "crawl.completed" : "batch_scrape.completed"
             );
           }
         } else {
@@ -487,67 +469,59 @@ async function processJob(job: Job, token: string) {
               [],
               job.data.webhook,
               job.data.v1,
-              "crawl.completed"
+              job.data.crawlerOptions !== null ? "crawl.completed" : "batch_scrape.completed"
               );
             }
 
           await logJob({
             job_id: job.data.crawl_id,
             success: jobStatus === "completed",
-            message: sc.cancelled ? "Cancelled" : message,
+            message: sc.cancelled ? "Cancelled" : undefined,
             num_docs: jobIDs.length,
             docs: [],
             time_taken: (Date.now() - sc.createdAt) / 1000,
             team_id: job.data.team_id,
-            mode: "crawl",
-            url: sc.originUrl,
+            scrapeOptions: sc.scrapeOptions,
+            mode: job.data.crawlerOptions !== null ? "crawl" : "batch_scrape",
+            url: sc?.originUrl ?? (job.data.crawlerOptions === null ? "Batch Scrape" : "Unknown"),
             crawlerOptions: sc.crawlerOptions,
-            pageOptions: sc.pageOptions,
             origin: job.data.origin,
-          });
+          }, true);
         }
       }
     }
 
-    Logger.info(`🐂 Job done ${job.id}`);
+    logger.info(`🐂 Job done ${job.id}`);
     return data;
   } catch (error) {
-    Logger.error(`🐂 Job errored ${job.id} - ${error}`);
+    const isEarlyTimeout = error instanceof Error && error.message === "timeout";
 
-    if (!(error instanceof Error && error.message.includes("JSON parsing error(s): "))) {
+    if (!isEarlyTimeout) {
+      logger.error(`🐂 Job errored ${job.id} - ${error}`);
+
       Sentry.captureException(error, {
         data: {
           job: job.id,
         },
       });
-    }
 
-    if (error instanceof CustomError) {
-      // Here we handle the error, then save the failed job
-      Logger.error(error.message); // or any other error handling
-
-      logtail.error("Custom error while ingesting", {
-        job_id: job.id,
-        error: error.message,
-        dataIngestionJob: error.dataIngestionJob,
-      });
+      if (error instanceof CustomError) {
+        // Here we handle the error, then save the failed job
+        logger.error(error.message); // or any other error handling
+      }
+      logger.error(error);
+      if (error.stack) {
+        logger.error(error.stack);
+      }
+    } else {
+      logger.error(`🐂 Job timed out ${job.id}`);
     }
-    Logger.error(error);
-    if (error.stack) {
-      Logger.error(error.stack);
-    }
-
-    logtail.error("Overall error ingesting", {
-      job_id: job.id,
-      error: error.message,
-    });
 
     const data = {
       success: false,
-      docs: [],
+      document: null,
       project_id: job.data.project_id,
-      error:
-        "Something went wrong... Contact help@mendable.ai or try again." /* etc... */,
+      error: error instanceof Error ? error : typeof error === "string" ? new Error(error) : new Error(JSON.stringify(error)),
     };
 
     if (!job.data.v1 && (job.data.mode === "crawl" || job.data.crawl_id)) {
@@ -556,7 +530,8 @@ async function processJob(job: Job, token: string) {
         job.data.crawl_id ?? (job.id as string),
         data,
         job.data.webhook,
-        job.data.v1
+        job.data.v1,
+        job.data.crawlerOptions !== null ? "crawl.page" : "batch_scrape.page",
       );
     }
     // if (job.data.v1) {
@@ -571,6 +546,8 @@ async function processJob(job: Job, token: string) {
     // }
 
     if (job.data.crawl_id) {
+      const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
+
       await logJob({
         job_id: job.id as string,
         success: false,
@@ -585,32 +562,30 @@ async function processJob(job: Job, token: string) {
         team_id: job.data.team_id,
         mode: job.data.mode,
         url: job.data.url,
-        crawlerOptions: job.data.crawlerOptions,
-        pageOptions: job.data.pageOptions,
+        crawlerOptions: sc.crawlerOptions,
+        scrapeOptions: job.data.scrapeOptions,
         origin: job.data.origin,
         crawl_id: job.data.crawl_id,
-      });
+      }, true);
 
-      const sc = await getCrawl(job.data.crawl_id);
-
-      await logJob({
-        job_id: job.data.crawl_id,
-        success: false,
-        message:
-          typeof error === "string"
-            ? error
-            : error.message ??
-              "Something went wrong... Contact help@mendable.ai",
-        num_docs: 0,
-        docs: [],
-        time_taken: 0,
-        team_id: job.data.team_id,
-        mode: "crawl",
-        url: sc ? sc.originUrl : job.data.url,
-        crawlerOptions: sc ? sc.crawlerOptions : job.data.crawlerOptions,
-        pageOptions: sc ? sc.pageOptions : job.data.pageOptions,
-        origin: job.data.origin,
-      });
+      // await logJob({
+      //   job_id: job.data.crawl_id,
+      //   success: false,
+      //   message:
+      //     typeof error === "string"
+      //       ? error
+      //       : error.message ??
+      //         "Something went wrong... Contact help@mendable.ai",
+      //   num_docs: 0,
+      //   docs: [],
+      //   time_taken: 0,
+      //   team_id: job.data.team_id,
+      //   mode: job.data.crawlerOptions !== null ? "crawl" : "batch_scrape",
+      //   url: sc ? sc.originUrl ?? job.data.url : job.data.url,
+      //   crawlerOptions: sc ? sc.crawlerOptions : undefined,
+      //   scrapeOptions: sc ? sc.scrapeOptions : job.data.scrapeOptions,
+      //   origin: job.data.origin,
+      // });
     }
     // done(null, data);
     return data;
